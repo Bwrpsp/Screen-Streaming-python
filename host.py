@@ -1,3 +1,4 @@
+import os
 import socket
 import threading
 import time
@@ -8,6 +9,13 @@ import numpy as np
 import pyaudio
 import av
 from fractions import Fraction
+import ssl
+import datetime
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 
 # Configurations
 PORT = 9999
@@ -22,6 +30,57 @@ connected_clients = []  # list of client_info dicts: {'socket': s, 'addr': a, 'l
 clients_lock = threading.Lock()
 screenshot_warning_printed = False
 
+def generate_self_signed_cert(cert_path="cert.pem", key_path="key.pem"):
+    """Programmatically generates a self-signed SSL/TLS certificate and key if they don't exist."""
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return  # Already exists
+        
+    print("[Host] Generating self-signed SSL certificate...")
+    # Generate private key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+    
+    # Generate self-signed certificate
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "California"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, "San Francisco"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Antigravity Streamer"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+    ])
+    
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        private_key.public_key()
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    ).not_valid_after(
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
+    ).add_extension(
+        x509.SubjectAlternativeName([x509.DNSName("localhost")]),
+        critical=False,
+    ).sign(private_key, hashes.SHA256())
+    
+    # Write certificate to file
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+        
+    # Write private key to file
+    with open(key_path, "wb") as f:
+        f.write(private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+    print("[Host] SSL certificate generated successfully.")
+
 def get_local_ip():
     """Attempts to find the local IP address by creating a dummy UDP connection."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -34,7 +93,7 @@ def get_local_ip():
         s.close()
     return ip
 
-def get_fallback_frame(width=1280, height=720):
+def get_fallback_frame(width=2560, height=1440):
     """Generates a dynamic mock screen frame to display if screenshot capture fails."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     
@@ -46,7 +105,7 @@ def get_fallback_frame(width=1280, height=720):
         frame[y, :, 2] = int(val * 0.2)  # R
         
     # Title & Text warnings
-    cv2.putText(frame, "Host Screen Stream (H.264 TCP Mode)", (50, 100),
+    cv2.putText(frame, "Host Screen Stream (H.264 TCP SSL/TLS Mode)", (50, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(frame, "Screen capture failed (session is locked or headless).", (50, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
@@ -84,8 +143,12 @@ def accept_clients(server_sock):
             }
             with clients_lock:
                 connected_clients.append(client_info)
-                print(f"[Host] Client connected: {addr[0]}:{addr[1]} (Total: {len(connected_clients)})")
+                print(f"[Host] Client connected securely: {addr[0]}:{addr[1]} (Total: {len(connected_clients)})")
         except socket.timeout:
+            continue
+        except ssl.SSLError as e:
+            # Catch client SSL handshake failures without breaking the main loop
+            print(f"[Host] SSL Handshake failure with client: {e}")
             continue
         except Exception as e:
             if running:
@@ -177,10 +240,19 @@ def main():
     global running, screenshot_warning_printed
     local_ip = get_local_ip()
     print("=" * 60)
-    print(f"  Antigravity H.264 Streamer - HOST (TCP MODE)")
+    print(f"  Antigravity H.264 Streamer - HOST (TCP SSL/TLS MODE)")
     print(f"  Local IP: {local_ip}")
     print(f"  Port:     {PORT}")
     print("=" * 60)
+
+    # Dynamic Self-Signed Certificate Generation
+    cert_file = "cert.pem"
+    key_file = "key.pem"
+    try:
+        generate_self_signed_cert(cert_file, key_file)
+    except Exception as e:
+        print(f"[Host] ERROR: Failed to prepare SSL/TLS certificates: {e}")
+        return
 
     # Determine screen resolution dynamically before initializing encoder
     with mss.mss() as sct:
@@ -192,7 +264,7 @@ def main():
         screen_h = monitor["height"]
 
     # Calculate dynamic H.264 YUV-compatible dimensions (must be even numbers)
-    target_width = 1280
+    target_width = 2560
     if screen_w > target_width:
         scale = target_width / screen_w
         target_height = int(screen_h * scale)
@@ -210,17 +282,30 @@ def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
+    # Create SSL Context
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    
+    # Wrap standard socket in SSL for TLS server functionality
     try:
-        server_sock.bind(('0.0.0.0', PORT))
-        server_sock.listen(5)
+        secure_server_sock = ssl_context.wrap_socket(server_sock, server_side=True)
     except Exception as e:
-        print(f"[Host] ERROR: Could not bind to port {PORT}: {e}")
+        print(f"[Host] ERROR: Failed to wrap server socket in SSL: {e}")
+        server_sock.close()
         return
 
-    server_sock.settimeout(1.0)
+    try:
+        secure_server_sock.bind(('0.0.0.0', PORT))
+        secure_server_sock.listen(5)
+    except Exception as e:
+        print(f"[Host] ERROR: Could not bind to port {PORT}: {e}")
+        secure_server_sock.close()
+        return
 
-    # Start client acceptor thread
-    acceptor_thread = threading.Thread(target=accept_clients, args=(server_sock,), daemon=True)
+    secure_server_sock.settimeout(1.0)
+
+    # Start client acceptor thread (passing secure socket)
+    acceptor_thread = threading.Thread(target=accept_clients, args=(secure_server_sock,), daemon=True)
     acceptor_thread.start()
 
     # Start audio stream thread
@@ -234,7 +319,7 @@ def main():
     encoder.height = target_height
     encoder.pix_fmt = 'yuv420p'
     encoder.time_base = Fraction(1, FRAME_RATE)
-    encoder.bit_rate = 1500000  # 1.5 Mbps
+    encoder.bit_rate = 15000000  # 15 Mbps for high resolution
     encoder.gop_size = 25  # Force an I-frame every 25 frames (once per second)
     encoder.options = {
         'preset': 'ultrafast',
@@ -242,11 +327,10 @@ def main():
     }
     encoder.open()
 
-    print("[Host] Screen streaming initialized. Waiting for connections...")
+    print("[Host] Screen streaming initialized securely. Waiting for connections...")
 
     # Screen capture stream
     with mss.mss() as sct:
-        # Keep capture screen coordinate structure aligned with monitor
         if len(sct.monitors) > 1:
             monitor = sct.monitors[1]
         else:
@@ -294,7 +378,7 @@ def main():
                 if frame_id % 25 == 0:
                     with clients_lock:
                         clients_count = len(connected_clients)
-                    print(f"[DEBUG] Broadcasted H.264 frame {frame_id} to {clients_count} clients.")
+                    print(f"[DEBUG] Broadcasted secure H.264 frame {frame_id} to {clients_count} clients.")
 
                 frame_id = (frame_id + 1) % 4294967295  # prevent overflow
 
@@ -327,7 +411,7 @@ def main():
                 connected_clients.clear()
             
             # Close server socket
-            server_sock.close()
+            secure_server_sock.close()
             print("[Host] Shutdown complete.")
 
 if __name__ == '__main__':

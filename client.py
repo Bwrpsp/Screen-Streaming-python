@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import pyaudio
 import av
+import ssl
 
 # Configurations
 PORT = 9999
@@ -142,7 +143,7 @@ def main():
     global running, latest_frame
 
     print("=" * 60)
-    print("  Antigravity H.264 Streamer - CLIENT (TCP RECEIVER)")
+    print("  Antigravity H.264 Streamer - CLIENT (TCP SSL/TLS RECEIVER)")
     print("=" * 60)
 
     # Prompt user for host IP
@@ -151,15 +152,31 @@ def main():
         print("[Client] Error: Host IP cannot be empty.")
         return
 
-    # Setup TCP Socket
+    # Setup standard TCP Socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(5.0)
 
-    print(f"[Client] Connecting to host at {host_ip}:{PORT}...")
+    # Create SSL Context
+    # Using PROTOCOL_TLS_CLIENT creates context for client side connections
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # Bypass certificate authority verification for local self-signed certificates
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    # Wrap the socket in SSL/TLS context
     try:
-        sock.connect((host_ip, PORT))
+        secure_sock = ssl_context.wrap_socket(sock, server_hostname=host_ip)
     except Exception as e:
-        print(f"[Client] ERROR: Connection failed: {e}")
+        print(f"[Client] ERROR: Failed to wrapping socket in SSL/TLS context: {e}")
+        sock.close()
+        return
+
+    print(f"[Client] Connecting securely to host at {host_ip}:{PORT}...")
+    try:
+        secure_sock.connect((host_ip, PORT))
+    except Exception as e:
+        print(f"[Client] ERROR: Secure connection failed: {e}")
+        secure_sock.close()
         return
 
     # Setup PyAV H.264 Decoder
@@ -167,17 +184,17 @@ def main():
     decoder = av.CodecContext.create(codec)
     decoder.open()
 
-    print("[Client] Connection established. Initializing H.264 stream...")
+    print("[Client] Secure connection established. Initializing H.264 stream...")
 
-    # Start network and audio play threads
-    recv_thread = threading.Thread(target=receive_packets, args=(sock, decoder), daemon=True)
+    # Start secure network and audio play threads
+    recv_thread = threading.Thread(target=receive_packets, args=(secure_sock, decoder), daemon=True)
     audio_thread = threading.Thread(target=audio_play_loop, daemon=True)
 
     recv_thread.start()
     audio_thread.start()
 
     # Create UI Window
-    window_name = f"H.264 Stream - Connected to {host_ip}"
+    window_name = f"Secure H.264 Stream - Connected to {host_ip}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
     print(f"[Client] Stream started. Open the OpenCV window and press 'q' to exit.")
@@ -191,7 +208,7 @@ def main():
                     latest_frame = None  # Consume frame
 
             if frame is not None:
-                # Render the decoded frame directly (no JPEG decoding needed on main thread!)
+                # Render the decoded frame directly
                 cv2.imshow(window_name, frame)
 
             # Wait key handles OpenCV GUI events (crucial!)
@@ -209,7 +226,7 @@ def main():
         print("\n[Client] Exiting...")
     finally:
         running = False
-        sock.close()
+        secure_sock.close()
         cv2.destroyAllWindows()
         print("[Client] Cleanup complete. Goodbye!")
 
