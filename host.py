@@ -8,7 +8,7 @@ import numpy as np
 import pyaudio
 
 # Configurations
-PORT = 67
+PORT = 9999
 CHUNK_SIZE = 60000  # Max size of UDP packet payload (under 65,507 bytes limit)
 FRAME_RATE = 25     # Target frames per second
 AUDIO_RATE = 22050  # Audio sample rate (Hz)
@@ -75,6 +75,7 @@ def listen_clients(sock):
         try:
             data, addr = sock.recvfrom(1024)
             if data == b'P':  # Client Ping
+                print(f"[DEBUG] Received Ping from {addr[0]}:{addr[1]}")
                 with clients_lock:
                     if addr not in active_clients:
                         print(f"[Host] Client connected: {addr[0]}:{addr[1]}")
@@ -122,6 +123,7 @@ def audio_stream_loop(sock):
         p.terminate()
         return
 
+    audio_pkt_count = 0
     while running:
         try:
             # Read audio data from default recording device
@@ -133,11 +135,16 @@ def audio_stream_loop(sock):
             
             # Broadcast to all registered clients
             with clients_lock:
+                clients_count = len(active_clients)
                 for addr in list(active_clients.keys()):
                     try:
                         sock.sendto(packet, addr)
                     except Exception:
                         pass
+            
+            audio_pkt_count += 1
+            if audio_pkt_count % 100 == 0:
+                print(f"[DEBUG] Sent {audio_pkt_count} audio packets to {clients_count} clients.")
         except Exception as e:
             if running:
                 print(f"[Host] Audio streaming error: {e}")
@@ -261,6 +268,11 @@ def main():
                                 sock.sendto(packet, addr)
                             except Exception:
                                 pass
+
+                if frame_id % 25 == 0:
+                    with clients_lock:
+                        clients_count = len(active_clients)
+                    print(f"[DEBUG] Sent frame {frame_id} ({total_bytes} bytes, {total_chunks} chunks) to {clients_count} clients.")
 
                 frame_id = (frame_id + 1) % 4294967295  # prevent overflow
 

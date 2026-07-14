@@ -8,7 +8,7 @@ import numpy as np
 import pyaudio
 
 # Configurations
-PORT = 67
+PORT = 9999
 AUDIO_RATE = 22050  # Audio sample rate (Hz)
 AUDIO_CHANNELS = 1  # 1 = Mono
 AUDIO_CHUNK = 1024  # Samples per buffer
@@ -25,6 +25,7 @@ def ping_host(sock, host_ip):
     print(f"[Client] Connection thread started. Pinging {host_ip}:{PORT}...")
     while running:
         try:
+            print(f"[DEBUG] Sending ping to {host_ip}:{PORT}...")
             sock.sendto(b'P', (host_ip, PORT))
         except Exception as e:
             print(f"[Client] Ping error: {e}")
@@ -34,6 +35,7 @@ def receive_packets(sock):
     """Receives UDP packets, parses them, handles audio play queues, and reassembles video frames."""
     global running, latest_frame
     frames_assembly = {}  # frame_id -> {'chunks': {chunk_idx: data}, 'total': N, 'timestamp': t}
+    audio_packets_recv = 0
 
     while running:
         try:
@@ -72,6 +74,9 @@ def receive_packets(sock):
                     with frame_lock:
                         latest_frame = full_frame_bytes
 
+                    if frame_id % 25 == 0:
+                        print(f"[DEBUG] Received and reassembled frame {frame_id} ({total_chunks} chunks, {len(full_frame_bytes)} bytes)")
+
                     # Prune old incomplete frames to prevent memory leaks
                     now = time.time()
                     expired = [fid for fid, info in frames_assembly.items() if now - info['timestamp'] > 2.0]
@@ -85,11 +90,16 @@ def receive_packets(sock):
                 except queue.Full:
                     # Drop audio packets if client buffer overflows to stay real-time
                     pass
+                
+                audio_packets_recv += 1
+                if audio_packets_recv % 100 == 0:
+                    print(f"[DEBUG] Received {audio_packets_recv} audio packets. Queue size: {audio_queue.qsize()}")
 
         except socket.timeout:
             continue
         except ConnectionResetError:
             # Host went offline or reset.
+            print("[DEBUG] Host disconnected (Connection Reset). Waiting for host to come back...")
             continue
         except Exception as e:
             if running:
