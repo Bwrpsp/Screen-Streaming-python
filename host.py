@@ -15,10 +15,11 @@ AUDIO_RATE = 22050  # Audio sample rate (Hz)
 AUDIO_CHANNELS = 1  # 1 = Mono, 2 = Stereo
 AUDIO_CHUNK = 1024  # Samples per buffer
 
+# Broadcast destination configuration
+BROADCAST_ADDR = ('255.255.255.255', PORT)
+
 # Threading states
 running = True
-active_clients = {}  # (ip, port) -> last_seen_timestamp
-clients_lock = threading.Lock()
 screenshot_warning_printed = False
 
 def get_local_ip():
@@ -46,7 +47,7 @@ def get_fallback_frame(width=1280, height=720):
         frame[y, :, 2] = int(val * 0.2)  # R
         
     # Title & Text warnings
-    cv2.putText(frame, "Host Screen Stream (Fallback Test Pattern)", (50, 100),
+    cv2.putText(frame, "Host Screen Stream (Broadcast Mode)", (50, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(frame, "Screen capture failed (session is locked or headless).", (50, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
@@ -67,45 +68,8 @@ def get_fallback_frame(width=1280, height=720):
                 
     return frame
 
-def listen_clients(sock):
-    """Listens for keep-alive/registration ping packets from clients on port 67."""
-    global running
-    print(f"[Host] Listening for clients on UDP port {PORT}...")
-    while running:
-        try:
-            data, addr = sock.recvfrom(1024)
-            if data == b'P':  # Client Ping
-                print(f"[DEBUG] Received Ping from {addr[0]}:{addr[1]}")
-                with clients_lock:
-                    if addr not in active_clients:
-                        print(f"[Host] Client connected: {addr[0]}:{addr[1]}")
-                    active_clients[addr] = time.time()
-        except socket.timeout:
-            continue
-        except ConnectionResetError:
-            # On Windows, sending to a client that closed its socket can cause
-            # ConnectionResetError on the next recvfrom call. We can safely ignore it.
-            continue
-        except Exception as e:
-            if running:
-                print(f"[Host] Socket error in client listener: {e}")
-            break
-
-def clean_inactive_clients():
-    """Periodically prunes clients that haven't sent a keep-alive ping recently."""
-    global running
-    while running:
-        time.sleep(2)
-        now = time.time()
-        with clients_lock:
-            # If client hasn't pinged in 6 seconds, consider them disconnected
-            to_remove = [addr for addr, last_seen in active_clients.items() if now - last_seen > 6.0]
-            for addr in to_remove:
-                print(f"[Host] Client disconnected (timeout): {addr[0]}:{addr[1]}")
-                del active_clients[addr]
-
 def audio_stream_loop(sock):
-    """Captures microphone/input audio and streams it to all active clients."""
+    """Captures microphone/input audio and broadcasts it to the network."""
     global running
     p = pyaudio.PyAudio()
     stream = None
@@ -133,18 +97,12 @@ def audio_stream_loop(sock):
             # Format audio packet: Header 'A' (1 byte) + raw PCM data
             packet = b'A' + audio_data
             
-            # Broadcast to all registered clients
-            with clients_lock:
-                clients_count = len(active_clients)
-                for addr in list(active_clients.keys()):
-                    try:
-                        sock.sendto(packet, addr)
-                    except Exception:
-                        pass
+            # Broadcast to local network
+            sock.sendto(packet, BROADCAST_ADDR)
             
             audio_pkt_count += 1
             if audio_pkt_count % 100 == 0:
-                print(f"[DEBUG] Sent {audio_pkt_count} audio packets to {clients_count} clients.")
+                print(f"[DEBUG] Broadcasted {audio_pkt_count} audio packets.")
         except Exception as e:
             if running:
                 print(f"[Host] Audio streaming error: {e}")
@@ -163,35 +121,28 @@ def main():
     global running, screenshot_warning_printed
     local_ip = get_local_ip()
     print("=" * 60)
-    print(f"  Antigravity UDP Streamer - HOST")
+    print(f"  Antigravity UDP Streamer - HOST (BROADCAST MODE)")
     print(f"  Local IP: {local_ip}")
-    print(f"  Port:     {PORT}")
+    print(f"  Broadcast Port: {PORT}")
     print("=" * 60)
 
     # Setup UDP Socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Enable SO_REUSEADDR in case socket was recently closed
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Enable Broadcast option
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     
+    # Bind host socket to ephemeral port to avoid conflicts with clients running on the same host machine
     try:
-        sock.bind(('0.0.0.0', PORT))
+        sock.bind(('0.0.0.0', 0))
     except Exception as e:
-        print(f"[Host] ERROR: Could not bind to port {PORT}: {e}")
-        print("Make sure no other program (like a DHCP server) is using port 67 and you have permissions.")
+        print(f"[Host] ERROR: Could not bind host socket: {e}")
         return
 
-    sock.settimeout(1.0)
-
-    # Start listener threads
-    listener_thread = threading.Thread(target=listen_clients, args=(sock,), daemon=True)
-    cleanup_thread = threading.Thread(target=clean_inactive_clients, daemon=True)
+    # Start audio broadcast thread
     audio_thread = threading.Thread(target=audio_stream_loop, args=(sock,), daemon=True)
-
-    listener_thread.start()
-    cleanup_thread.start()
     audio_thread.start()
 
-    print("[Host] Screen streaming started. Waiting for clients to connect...")
+    print(f"[Host] Broadcasting screen and audio to {BROADCAST_ADDR[0]}:{BROADCAST_ADDR[1]}...")
 
     # Screen capture stream
     with mss.mss() as sct:
@@ -207,17 +158,6 @@ def main():
         try:
             while running:
                 start_time = time.time()
-                
-                # Check if there are any clients before processing screen capture
-                # to save CPU cycles when idle
-                has_clients = False
-                with clients_lock:
-                    if len(active_clients) > 0:
-                        has_clients = True
-
-                if not has_clients:
-                    time.sleep(0.1)
-                    continue
 
                 try:
                     # Capture screen frame
@@ -226,7 +166,7 @@ def main():
                     # Convert BGRA to BGR for OpenCV
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-                    # Downscale screen for efficient local network transmission
+                    # Downscale screen for efficient network transmission
                     h, w = frame.shape[:2]
                     target_width = 1280
                     if w > target_width:
@@ -262,17 +202,13 @@ def main():
                     header = struct.pack('!B I H H', ord('V'), frame_id, chunk_idx, total_chunks)
                     packet = header + chunk_data
 
-                    with clients_lock:
-                        for addr in list(active_clients.keys()):
-                            try:
-                                sock.sendto(packet, addr)
-                            except Exception:
-                                pass
+                    try:
+                        sock.sendto(packet, BROADCAST_ADDR)
+                    except Exception:
+                        pass
 
                 if frame_id % 25 == 0:
-                    with clients_lock:
-                        clients_count = len(active_clients)
-                    print(f"[DEBUG] Sent frame {frame_id} ({total_bytes} bytes, {total_chunks} chunks) to {clients_count} clients.")
+                    print(f"[DEBUG] Broadcasted frame {frame_id} ({total_bytes} bytes, {total_chunks} chunks).")
 
                 frame_id = (frame_id + 1) % 4294967295  # prevent overflow
 

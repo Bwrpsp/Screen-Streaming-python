@@ -19,18 +19,6 @@ latest_frame = None
 frame_lock = threading.Lock()
 audio_queue = queue.Queue(maxsize=50)
 
-def ping_host(sock, host_ip):
-    """Sends periodic ping packets to host to register and keep the connection alive."""
-    global running
-    print(f"[Client] Connection thread started. Pinging {host_ip}:{PORT}...")
-    while running:
-        try:
-            print(f"[DEBUG] Sending ping to {host_ip}:{PORT}...")
-            sock.sendto(b'P', (host_ip, PORT))
-        except Exception as e:
-            print(f"[Client] Ping error: {e}")
-        time.sleep(2.0)
-
 def receive_packets(sock):
     """Receives UDP packets, parses them, handles audio play queues, and reassembles video frames."""
     global running, latest_frame
@@ -99,7 +87,7 @@ def receive_packets(sock):
             continue
         except ConnectionResetError:
             # Host went offline or reset.
-            print("[DEBUG] Host disconnected (Connection Reset). Waiting for host to come back...")
+            print("[DEBUG] Connection reset or lost.")
             continue
         except Exception as e:
             if running:
@@ -159,35 +147,37 @@ def main():
     global running, latest_frame
 
     print("=" * 60)
-    print("  Antigravity UDP Streamer - CLIENT")
+    print("  Antigravity UDP Streamer - CLIENT (RECEIVER)")
+    print(f"  Listening on Broadcast Port: {PORT}")
     print("=" * 60)
-
-    # Prompt user for host IP
-    host_ip = input("Enter the Host IP Address: ").strip()
-    if not host_ip:
-        print("[Client] Error: Host IP cannot be empty.")
-        return
 
     # Setup UDP Socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Bind to ephemeral port
-    sock.bind(('0.0.0.0', 0))
+    # Enable address reuse so multiple clients can run on the same computer
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Bind to broadcast port on all interfaces
+    try:
+        sock.bind(('0.0.0.0', PORT))
+    except Exception as e:
+        print(f"[Client] ERROR: Could not bind to port {PORT}: {e}")
+        print("Ensure no other application is locking the port.")
+        return
+        
     sock.settimeout(1.0)
 
     # Start network and audio play threads
-    ping_thread = threading.Thread(target=ping_host, args=(sock, host_ip), daemon=True)
     recv_thread = threading.Thread(target=receive_packets, args=(sock,), daemon=True)
     audio_thread = threading.Thread(target=audio_play_loop, daemon=True)
 
-    ping_thread.start()
     recv_thread.start()
     audio_thread.start()
 
     # Create UI Window
-    window_name = f"Screen Stream - Connected to {host_ip}"
+    window_name = f"Screen Stream (Port {PORT})"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
-    print(f"[Client] Connecting to host... Open the OpenCV window and press 'q' to exit.")
+    print(f"[Client] Listening... Open the OpenCV window and press 'q' to exit.")
 
     try:
         while running:
@@ -213,7 +203,6 @@ def main():
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                     break
             except Exception:
-                # Handle window property check failure (e.g. if already closed)
                 break
 
     except KeyboardInterrupt:
