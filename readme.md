@@ -60,7 +60,9 @@ python client.py
 
 - When prompted, enter the **Host IP Address** that was printed by the host.
 - A display window will open showcasing the host's screen securely.
-- Press **`q`** inside the display window to exit cleanly.
+- Controls inside the display window:
+  - Press **`f`** to toggle **Fullscreen / Windowed** mode.
+  - Press **`q`** to exit cleanly.
 
 ---
 

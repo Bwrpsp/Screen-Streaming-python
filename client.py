@@ -197,7 +197,9 @@ def main():
     window_name = f"Secure H.264 Stream - Connected to {host_ip}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
-    print(f"[Client] Stream started. Open the OpenCV window and press 'q' to exit.")
+    print(f"[Client] Stream started. Open the OpenCV window:")
+    print(f"         - Press 'f' to toggle Fullscreen/Windowed")
+    print(f"         - Press 'q' to quit")
 
     try:
         while running:
@@ -212,8 +214,16 @@ def main():
                 cv2.imshow(window_name, frame)
 
             # Wait key handles OpenCV GUI events (crucial!)
-            if cv2.waitKey(10) & 0xFF == ord('q'):
+            key = cv2.waitKey(10) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('f') or key == ord('F'):
+                # Toggle fullscreen
+                is_fullscreen = cv2.getWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN)
+                if is_fullscreen == cv2.WINDOW_FULLSCREEN:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                else:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
             # Handle case where user closes OpenCV window via 'X' button
             try:
