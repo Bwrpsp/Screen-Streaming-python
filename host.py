@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import pyaudio
 import av
+from fractions import Fraction
 
 # Configurations
 PORT = 9999
@@ -181,6 +182,30 @@ def main():
     print(f"  Port:     {PORT}")
     print("=" * 60)
 
+    # Determine screen resolution dynamically before initializing encoder
+    with mss.mss() as sct:
+        if len(sct.monitors) > 1:
+            monitor = sct.monitors[1]
+        else:
+            monitor = sct.monitors[0]
+        screen_w = monitor["width"]
+        screen_h = monitor["height"]
+
+    # Calculate dynamic H.264 YUV-compatible dimensions (must be even numbers)
+    target_width = 1280
+    if screen_w > target_width:
+        scale = target_width / screen_w
+        target_height = int(screen_h * scale)
+    else:
+        target_width = screen_w
+        target_height = screen_h
+
+    # Ensure even dimensions (divisible by 2) for YUV420P alignment
+    target_width = (target_width // 2) * 2
+    target_height = (target_height // 2) * 2
+
+    print(f"[Host] Dynamic Stream Resolution set to: {target_width}x{target_height}")
+
     # Setup TCP Server Socket
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -205,10 +230,10 @@ def main():
     # Setup PyAV H.264 Encoder
     codec = av.Codec('h264', 'w')
     encoder = av.CodecContext.create(codec)
-    encoder.width = 1280
-    encoder.height = 720
+    encoder.width = target_width
+    encoder.height = target_height
     encoder.pix_fmt = 'yuv420p'
-    encoder.time_base = '1/25'
+    encoder.time_base = Fraction(1, FRAME_RATE)
     encoder.bit_rate = 1500000  # 1.5 Mbps
     encoder.gop_size = 25  # Force an I-frame every 25 frames (once per second)
     encoder.options = {
@@ -221,7 +246,7 @@ def main():
 
     # Screen capture stream
     with mss.mss() as sct:
-        # Use primary monitor if available, otherwise virtual/all monitors
+        # Keep capture screen coordinate structure aligned with monitor
         if len(sct.monitors) > 1:
             monitor = sct.monitors[1]
         else:
@@ -249,19 +274,13 @@ def main():
                     frame = np.array(sct_img)
                     # Convert BGRA to BGR
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-
-                    # Downscale screen for efficient streaming
-                    h, w = frame.shape[:2]
-                    target_width = 1280
-                    if w > target_width:
-                        scale = target_width / w
-                        target_height = int(h * scale)
-                        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                    # Resize to dynamic target dimensions
+                    frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
                 except Exception as e:
                     if not screenshot_warning_printed:
                         print(f"[Host] WARNING: Screen capture failed ({e}). Using fallback test pattern.")
                         screenshot_warning_printed = True
-                    frame = get_fallback_frame()
+                    frame = get_fallback_frame(target_width, target_height)
 
                 # Convert numpy array to PyAV VideoFrame
                 av_frame = av.VideoFrame.from_ndarray(frame, format='bgr24')
@@ -269,7 +288,7 @@ def main():
                 # Encode the frame into H.264 packets
                 packets = encoder.encode(av_frame)
                 for packet in packets:
-                    h264_data = packet.to_bytes()
+                    h264_data = bytes(packet)
                     broadcast_packet('V', h264_data)
 
                 if frame_id % 25 == 0:
@@ -293,7 +312,7 @@ def main():
             try:
                 packets = encoder.encode(None)
                 for packet in packets:
-                    h264_data = packet.to_bytes()
+                    h264_data = bytes(packet)
                     broadcast_packet('V', h264_data)
             except Exception:
                 pass
