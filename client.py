@@ -6,6 +6,7 @@ import queue
 import cv2
 import numpy as np
 import pyaudio
+import av
 
 # Configurations
 PORT = 9999
@@ -19,80 +20,74 @@ latest_frame = None
 frame_lock = threading.Lock()
 audio_queue = queue.Queue(maxsize=50)
 
-def receive_packets(sock):
-    """Receives UDP packets, parses them, handles audio play queues, and reassembles video frames."""
+def recv_all(sock, length):
+    """Utility to receive exactly the specified number of bytes from the TCP socket."""
+    data = b''
+    while len(data) < length:
+        try:
+            packet = sock.recv(length - len(data))
+            if not packet:
+                return None
+            data += packet
+        except socket.timeout:
+            if not running:
+                return None
+            continue
+        except Exception:
+            return None
+    return data
+
+def recv_msg(sock):
+    """Parses a custom framed message from the TCP socket."""
+    # Read header (1 byte type + 4 bytes payload length)
+    header = recv_all(sock, 5)
+    if not header:
+        return None, None
+    msg_type, length = struct.unpack('!B I', header)
+    payload = recv_all(sock, length)
+    return chr(msg_type), payload
+
+def receive_packets(sock, decoder):
+    """Receives TCP packets and handles H.264 video decoding and audio buffer queueing."""
     global running, latest_frame
-    frames_assembly = {}  # frame_id -> {'chunks': {chunk_idx: data}, 'total': N, 'timestamp': t}
     audio_packets_recv = 0
+    video_frames_recv = 0
 
     while running:
-        try:
-            data, addr = sock.recvfrom(65535)
-            if not data:
-                continue
-
-            packet_type = chr(data[0])
-            if packet_type == 'V':  # Video packet
-                if len(data) < 9:
-                    continue
-                
-                # Header format:
-                # - 'V' (1 byte)
-                # - frame_id (4 bytes, uint32)
-                # - chunk_idx (2 bytes, uint16)
-                # - total_chunks (2 bytes, uint16)
-                header = data[:9]
-                chunk_data = data[9:]
-                _, frame_id, chunk_idx, total_chunks = struct.unpack('!B I H H', header)
-
-                if frame_id not in frames_assembly:
-                    frames_assembly[frame_id] = {
-                        'chunks': {},
-                        'total': total_chunks,
-                        'timestamp': time.time()
-                    }
-
-                frames_assembly[frame_id]['chunks'][chunk_idx] = chunk_data
-
-                # If all chunks are successfully received, assemble frame
-                if len(frames_assembly[frame_id]['chunks']) == total_chunks:
-                    chunks_dict = frames_assembly[frame_id]['chunks']
-                    full_frame_bytes = b''.join(chunks_dict[i] for i in sorted(chunks_dict.keys()))
-
-                    with frame_lock:
-                        latest_frame = full_frame_bytes
-
-                    if frame_id % 25 == 0:
-                        print(f"[DEBUG] Received and reassembled frame {frame_id} ({total_chunks} chunks, {len(full_frame_bytes)} bytes)")
-
-                    # Prune old incomplete frames to prevent memory leaks
-                    now = time.time()
-                    expired = [fid for fid, info in frames_assembly.items() if now - info['timestamp'] > 2.0]
-                    for fid in expired:
-                        del frames_assembly[fid]
-
-            elif packet_type == 'A':  # Audio packet
-                audio_data = data[1:]
-                try:
-                    audio_queue.put_nowait(audio_data)
-                except queue.Full:
-                    # Drop audio packets if client buffer overflows to stay real-time
-                    pass
-                
-                audio_packets_recv += 1
-                if audio_packets_recv % 100 == 0:
-                    print(f"[DEBUG] Received {audio_packets_recv} audio packets. Queue size: {audio_queue.qsize()}")
-
-        except socket.timeout:
-            continue
-        except ConnectionResetError:
-            # Host went offline or reset.
-            print("[DEBUG] Connection reset or lost.")
-            continue
-        except Exception as e:
-            if running:
-                print(f"[Client] Socket receiver error: {e}")
+        msg_type, payload = recv_msg(sock)
+        if not msg_type:
+            print("[Client] Connection lost from host.")
             break
+
+        if msg_type == 'V':  # Video packet (H.264 bitstream)
+            try:
+                packet = av.Packet(payload)
+                frames = decoder.decode(packet)
+                for frame in frames:
+                    # Convert decoded YUV frame back to BGR numpy array
+                    bgr_arr = frame.to_ndarray(format='bgr24')
+                    with frame_lock:
+                        latest_frame = bgr_arr
+                    
+                    video_frames_recv += 1
+                    if video_frames_recv % 25 == 0:
+                        print(f"[DEBUG] Decoded video frame {video_frames_recv} (Size: {len(payload)} bytes).")
+            except Exception:
+                # Discard early decode errors before first GOP keyframe arrives
+                pass
+
+        elif msg_type == 'A':  # Audio packet (PCM)
+            try:
+                audio_queue.put_nowait(payload)
+            except queue.Full:
+                # Drop audio packets if client buffer overflows to stay real-time
+                pass
+            
+            audio_packets_recv += 1
+            if audio_packets_recv % 100 == 0:
+                print(f"[DEBUG] Received {audio_packets_recv} audio packets. Queue size: {audio_queue.qsize()}")
+
+    running = False
 
 def audio_play_loop():
     """Retrieves PCM audio data from queue and plays it back in real-time."""
@@ -147,52 +142,57 @@ def main():
     global running, latest_frame
 
     print("=" * 60)
-    print("  Antigravity UDP Streamer - CLIENT (RECEIVER)")
-    print(f"  Listening on Broadcast Port: {PORT}")
+    print("  Antigravity H.264 Streamer - CLIENT (TCP RECEIVER)")
     print("=" * 60)
 
-    # Setup UDP Socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Enable address reuse so multiple clients can run on the same computer
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    # Bind to broadcast port on all interfaces
-    try:
-        sock.bind(('0.0.0.0', PORT))
-    except Exception as e:
-        print(f"[Client] ERROR: Could not bind to port {PORT}: {e}")
-        print("Ensure no other application is locking the port.")
+    # Prompt user for host IP
+    host_ip = input("Enter the Host IP Address: ").strip()
+    if not host_ip:
+        print("[Client] Error: Host IP cannot be empty.")
         return
-        
-    sock.settimeout(1.0)
+
+    # Setup TCP Socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+
+    print(f"[Client] Connecting to host at {host_ip}:{PORT}...")
+    try:
+        sock.connect((host_ip, PORT))
+    except Exception as e:
+        print(f"[Client] ERROR: Connection failed: {e}")
+        return
+
+    # Setup PyAV H.264 Decoder
+    codec = av.Codec('h264', 'r')
+    decoder = av.CodecContext.create(codec)
+    decoder.open()
+
+    print("[Client] Connection established. Initializing H.264 stream...")
 
     # Start network and audio play threads
-    recv_thread = threading.Thread(target=receive_packets, args=(sock,), daemon=True)
+    recv_thread = threading.Thread(target=receive_packets, args=(sock, decoder), daemon=True)
     audio_thread = threading.Thread(target=audio_play_loop, daemon=True)
 
     recv_thread.start()
     audio_thread.start()
 
     # Create UI Window
-    window_name = f"Screen Stream (Port {PORT})"
+    window_name = f"H.264 Stream - Connected to {host_ip}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
-    print(f"[Client] Listening... Open the OpenCV window and press 'q' to exit.")
+    print(f"[Client] Stream started. Open the OpenCV window and press 'q' to exit.")
 
     try:
         while running:
-            frame_data = None
+            frame = None
             with frame_lock:
                 if latest_frame is not None:
-                    frame_data = latest_frame
+                    frame = latest_frame
                     latest_frame = None  # Consume frame
 
-            if frame_data is not None:
-                # Decode JPEG and display it
-                np_arr = np.frombuffer(frame_data, dtype=np.uint8)
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    cv2.imshow(window_name, frame)
+            if frame is not None:
+                # Render the decoded frame directly (no JPEG decoding needed on main thread!)
+                cv2.imshow(window_name, frame)
 
             # Wait key handles OpenCV GUI events (crucial!)
             if cv2.waitKey(10) & 0xFF == ord('q'):

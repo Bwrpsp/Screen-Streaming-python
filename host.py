@@ -6,27 +6,25 @@ import mss
 import cv2
 import numpy as np
 import pyaudio
+import av
 
 # Configurations
 PORT = 9999
-CHUNK_SIZE = 60000  # Max size of UDP packet payload (under 65,507 bytes limit)
 FRAME_RATE = 25     # Target frames per second
 AUDIO_RATE = 22050  # Audio sample rate (Hz)
 AUDIO_CHANNELS = 1  # 1 = Mono, 2 = Stereo
 AUDIO_CHUNK = 1024  # Samples per buffer
 
-# Broadcast destination configuration
-BROADCAST_ADDR = ('255.255.255.255', PORT)
-
-# Threading states
+# Threading and connection states
 running = True
+connected_clients = []  # list of client_info dicts: {'socket': s, 'addr': a, 'lock': l}
+clients_lock = threading.Lock()
 screenshot_warning_printed = False
 
 def get_local_ip():
     """Attempts to find the local IP address by creating a dummy UDP connection."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Does not send actual data, just opens a socket to check default interface
         s.connect(('8.8.8.8', 1))
         ip = s.getsockname()[0]
     except Exception:
@@ -47,7 +45,7 @@ def get_fallback_frame(width=1280, height=720):
         frame[y, :, 2] = int(val * 0.2)  # R
         
     # Title & Text warnings
-    cv2.putText(frame, "Host Screen Stream (Broadcast Mode)", (50, 100),
+    cv2.putText(frame, "Host Screen Stream (H.264 TCP Mode)", (50, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(frame, "Screen capture failed (session is locked or headless).", (50, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
@@ -68,8 +66,62 @@ def get_fallback_frame(width=1280, height=720):
                 
     return frame
 
-def audio_stream_loop(sock):
-    """Captures microphone/input audio and broadcasts it to the network."""
+def accept_clients(server_sock):
+    """Listens for and accepts incoming TCP client connections."""
+    global running
+    print(f"[Host] TCP server listening for clients on port {PORT}...")
+    while running:
+        try:
+            client_sock, addr = server_sock.accept()
+            # Set timeout on client socket so slow sends don't lock host thread
+            client_sock.settimeout(5.0)
+            
+            client_info = {
+                'socket': client_sock,
+                'addr': addr,
+                'lock': threading.Lock()
+            }
+            with clients_lock:
+                connected_clients.append(client_info)
+                print(f"[Host] Client connected: {addr[0]}:{addr[1]} (Total: {len(connected_clients)})")
+        except socket.timeout:
+            continue
+        except Exception as e:
+            if running:
+                print(f"[Host] Socket accept error: {e}")
+            break
+
+def cleanup_client(client):
+    """Safely closes and removes a disconnected client."""
+    with clients_lock:
+        if client in connected_clients:
+            print(f"[Host] Client disconnected: {client['addr'][0]}:{client['addr'][1]}")
+            connected_clients.remove(client)
+            try:
+                client['socket'].close()
+            except Exception:
+                pass
+
+def broadcast_packet(msg_type, payload):
+    """Sends a framed packet to all connected clients."""
+    # Framing header: packet type (1 byte) + payload length (4 bytes uint32)
+    header = struct.pack('!B I', ord(msg_type), len(payload))
+    packet = header + payload
+    
+    with clients_lock:
+        clients = list(connected_clients)
+        
+    for client in clients:
+        # Run send inside individual client lock to prevent message interleaving
+        try:
+            with client['lock']:
+                client['socket'].sendall(packet)
+        except Exception:
+            # Clean up client on send failure (e.g. disconnected)
+            cleanup_client(client)
+
+def audio_stream_loop():
+    """Captures microphone/input audio and broadcasts it to all TCP clients."""
     global running
     p = pyaudio.PyAudio()
     stream = None
@@ -89,20 +141,23 @@ def audio_stream_loop(sock):
 
     audio_pkt_count = 0
     while running:
+        # Sleep if no clients are connected to save CPU
+        with clients_lock:
+            has_clients = len(connected_clients) > 0
+        if not has_clients:
+            time.sleep(0.1)
+            continue
+            
         try:
-            # Read audio data from default recording device
-            # exception_on_overflow=False prevents crashes if CPU lags
+            # Read audio data from default device
             audio_data = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
             
-            # Format audio packet: Header 'A' (1 byte) + raw PCM data
-            packet = b'A' + audio_data
-            
-            # Broadcast to local network
-            sock.sendto(packet, BROADCAST_ADDR)
+            # Broadcast audio packet
+            broadcast_packet('A', audio_data)
             
             audio_pkt_count += 1
             if audio_pkt_count % 100 == 0:
-                print(f"[DEBUG] Broadcasted {audio_pkt_count} audio packets.")
+                print(f"[DEBUG] Sent {audio_pkt_count} audio packets.")
         except Exception as e:
             if running:
                 print(f"[Host] Audio streaming error: {e}")
@@ -121,28 +176,48 @@ def main():
     global running, screenshot_warning_printed
     local_ip = get_local_ip()
     print("=" * 60)
-    print(f"  Antigravity UDP Streamer - HOST (BROADCAST MODE)")
+    print(f"  Antigravity H.264 Streamer - HOST (TCP MODE)")
     print(f"  Local IP: {local_ip}")
-    print(f"  Broadcast Port: {PORT}")
+    print(f"  Port:     {PORT}")
     print("=" * 60)
 
-    # Setup UDP Socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Enable Broadcast option
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    # Setup TCP Server Socket
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
-    # Bind host socket to ephemeral port to avoid conflicts with clients running on the same host machine
     try:
-        sock.bind(('0.0.0.0', 0))
+        server_sock.bind(('0.0.0.0', PORT))
+        server_sock.listen(5)
     except Exception as e:
-        print(f"[Host] ERROR: Could not bind host socket: {e}")
+        print(f"[Host] ERROR: Could not bind to port {PORT}: {e}")
         return
 
-    # Start audio broadcast thread
-    audio_thread = threading.Thread(target=audio_stream_loop, args=(sock,), daemon=True)
+    server_sock.settimeout(1.0)
+
+    # Start client acceptor thread
+    acceptor_thread = threading.Thread(target=accept_clients, args=(server_sock,), daemon=True)
+    acceptor_thread.start()
+
+    # Start audio stream thread
+    audio_thread = threading.Thread(target=audio_stream_loop, daemon=True)
     audio_thread.start()
 
-    print(f"[Host] Broadcasting screen and audio to {BROADCAST_ADDR[0]}:{BROADCAST_ADDR[1]}...")
+    # Setup PyAV H.264 Encoder
+    codec = av.Codec('h264', 'w')
+    encoder = av.CodecContext.create(codec)
+    encoder.width = 1280
+    encoder.height = 720
+    encoder.pix_fmt = 'yuv420p'
+    encoder.time_base = '1/25'
+    encoder.bit_rate = 1500000  # 1.5 Mbps
+    encoder.gop_size = 25  # Force an I-frame every 25 frames (once per second)
+    encoder.options = {
+        'preset': 'ultrafast',
+        'tune': 'zerolatency'
+    }
+    encoder.open()
+
+    print("[Host] Screen streaming initialized. Waiting for connections...")
 
     # Screen capture stream
     with mss.mss() as sct:
@@ -158,15 +233,24 @@ def main():
         try:
             while running:
                 start_time = time.time()
+                
+                # Check if there are active clients before capturing screen
+                # to reduce CPU overhead when idle
+                with clients_lock:
+                    has_clients = len(connected_clients) > 0
+
+                if not has_clients:
+                    time.sleep(0.1)
+                    continue
 
                 try:
                     # Capture screen frame
                     sct_img = sct.grab(monitor)
                     frame = np.array(sct_img)
-                    # Convert BGRA to BGR for OpenCV
+                    # Convert BGRA to BGR
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-                    # Downscale screen for efficient network transmission
+                    # Downscale screen for efficient streaming
                     h, w = frame.shape[:2]
                     target_width = 1280
                     if w > target_width:
@@ -179,40 +263,23 @@ def main():
                         screenshot_warning_printed = True
                     frame = get_fallback_frame()
 
-                # Compress frame to JPEG
-                success, encoded_img = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-                if not success:
-                    continue
-
-                jpeg_bytes = encoded_img.tobytes()
-                total_bytes = len(jpeg_bytes)
-
-                # Segment and transmit the video frame
-                total_chunks = (total_bytes + CHUNK_SIZE - 1) // CHUNK_SIZE
-                for chunk_idx in range(total_chunks):
-                    start = chunk_idx * CHUNK_SIZE
-                    end = min(start + CHUNK_SIZE, total_bytes)
-                    chunk_data = jpeg_bytes[start:end]
-
-                    # Header:
-                    # - 'V' (1 byte)
-                    # - frame_id (4 bytes, unsigned int)
-                    # - chunk_idx (2 bytes, unsigned short)
-                    # - total_chunks (2 bytes, unsigned short)
-                    header = struct.pack('!B I H H', ord('V'), frame_id, chunk_idx, total_chunks)
-                    packet = header + chunk_data
-
-                    try:
-                        sock.sendto(packet, BROADCAST_ADDR)
-                    except Exception:
-                        pass
+                # Convert numpy array to PyAV VideoFrame
+                av_frame = av.VideoFrame.from_ndarray(frame, format='bgr24')
+                
+                # Encode the frame into H.264 packets
+                packets = encoder.encode(av_frame)
+                for packet in packets:
+                    h264_data = packet.to_bytes()
+                    broadcast_packet('V', h264_data)
 
                 if frame_id % 25 == 0:
-                    print(f"[DEBUG] Broadcasted frame {frame_id} ({total_bytes} bytes, {total_chunks} chunks).")
+                    with clients_lock:
+                        clients_count = len(connected_clients)
+                    print(f"[DEBUG] Broadcasted H.264 frame {frame_id} to {clients_count} clients.")
 
                 frame_id = (frame_id + 1) % 4294967295  # prevent overflow
 
-                # Calculate frame time and delay to hit target frame rate
+                # Calculate delay to hit target FPS
                 elapsed = time.time() - start_time
                 delay = max(0.001, frame_interval - elapsed)
                 time.sleep(delay)
@@ -221,7 +288,28 @@ def main():
             print("\n[Host] Shutting down...")
         finally:
             running = False
-            sock.close()
+            
+            # Flush encoder
+            try:
+                packets = encoder.encode(None)
+                for packet in packets:
+                    h264_data = packet.to_bytes()
+                    broadcast_packet('V', h264_data)
+            except Exception:
+                pass
+
+            # Close all client connections
+            with clients_lock:
+                for client in list(connected_clients):
+                    try:
+                        client['socket'].close()
+                    except Exception:
+                        pass
+                connected_clients.clear()
+            
+            # Close server socket
+            server_sock.close()
+            print("[Host] Shutdown complete.")
 
 if __name__ == '__main__':
     main()
